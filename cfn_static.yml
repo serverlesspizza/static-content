@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Serverless Pizza Infrastructure for Static Content
+
+Parameters:
+  DevOpsAccount:
+    Description: AWS AccountNumber for DevOps
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/devops_account'
+  DevAccount:
+    Description: AWS AccountNumber for Development
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/dev_account'
+  ProductionAccount:
+    Description: AWS AccountNumber for Production
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/prod_account'
+  Environment:
+    Description: The environment
+    Type: String
+  CertificateArn:
+    Description: The certificate ARN
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/certificate_arn'
+  HostedZoneId:
+    Description: The hosted zone ID
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/hosted_zone_id'
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      DomainName: "static.dev.serverlesspizza.com"
+    prod:
+      DomainName: "static.serverlesspizza.com"
+
+Resources:
+  OriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: 
+          !Join
+            - ''
+            - - 'access-identity-'
+              - !FindInMap [EnvironmentMap, !Ref Environment, DomainName]
+              - '.s3.amazonaws.com'
+
+  StaticContentBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Description: Amazon S3 bucket for the Static Content
+    Properties:
+      BucketName: !FindInMap [EnvironmentMap, !Ref Environment, DomainName]
+      PublicAccessBlockConfiguration:
+        RestrictPublicBuckets: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        BlockPublicAcls: true
+
+  StaticContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticContentBucket
+      PolicyDocument:
+        Statement:
+          -
+            Action:
+              - "s3:GetObject"
+            Effect: "Allow"
+            Resource: 
+              !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref StaticContentBucket
+                  - '/*'
+            Principal:
+              CanonicalUser: !GetAtt OriginAccessIdentity.S3CanonicalUserId
+          -
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref StaticContentBucket
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref StaticContentBucket
+                  - '/*'
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${ProductionAccount}:role/devopsAccountCodePipelineCFRole
+                - !Sub arn:aws:iam::${DevAccount}:role/devopsAccountCodePipelineCFRole
+
+  CloudFrontDistribution:
+    DependsOn:
+      - OriginAccessIdentity
+      - StaticContentBucket
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Origins:
+        - DomainName: !GetAtt StaticContentBucket.DomainName
+          Id: !Ref StaticContentBucket
+          S3OriginConfig:
+            OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${OriginAccessIdentity}"
+        Aliases:
+        - !FindInMap [EnvironmentMap, !Ref Environment, DomainName]
+        PriceClass: PriceClass_100
+        Comment: !FindInMap [EnvironmentMap, !Ref Environment, DomainName]
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Enabled: true
+        IPV6Enabled: true
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.1_2016
+        CustomErrorResponses:
+        - ErrorCachingMinTTL: 300
+          ErrorCode: 403
+          ResponseCode: 200
+          ResponsePagePath: /
+        DefaultCacheBehavior:
+          MinTTL: 30
+          MaxTTL: 120
+          DefaultTTL: 60
+          ForwardedValues:
+            QueryString: true
+          TargetOriginId: !Ref StaticContentBucket
+          ViewerProtocolPolicy: "redirect-to-https"
+
+  ApiDNSRecord:
+    DependsOn: CloudFrontDistribution
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Type: A
+          Name: !FindInMap [EnvironmentMap, !Ref Environment, DomainName]
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2 # (hardcoded for all CloudFormation templates)
+            DNSName: !GetAtt CloudFrontDistribution.DomainName
